@@ -1,0 +1,6 @@
+onlyBuiltDependencies:
+  - '@embedded-postgres/linux-x64'
+  - esbuild
+  - unrs-resolver
+  - msgpackr-extract
+  - core-js

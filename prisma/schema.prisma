@@ -1,0 +1,380 @@
+// ---------------------------------------------------------------------------
+// Bachatly — canonical data model
+// ---------------------------------------------------------------------------
+// Canonical hierarchy:
+//
+//   Retailer Listing  ->  Identity Resolution  ->  Bachatly Product
+//          ->  Product Variant  ->  Price (append-only history)
+//
+// Money is stored as INTEGER PAISE (1/100 of a rupee) everywhere. Integer money
+// keeps every calculation exact and behaves identically in SQL, in Prisma and
+// in the UI layer (which divides by 100 only when rendering).
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================== ENUMS ======================================
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum Availability {
+  IN_STOCK
+  LOW_STOCK
+  OUT_OF_STOCK
+  PREORDER
+  UNKNOWN
+}
+
+/// Where the data behind a listing came from. DEMO = seeded demonstration data
+/// (never presented to users as live). The other values are reserved for real,
+/// authorized integrations.
+enum ListingSource {
+  DEMO
+  LIVE_API
+  AFFILIATE_FEED
+  MANUAL
+}
+
+/// Outcome of product identity resolution for a retailer listing.
+enum ResolutionStatus {
+  RESOLVED
+  PENDING
+  UNMATCHED
+}
+
+enum IdentityMatchStatus {
+  ACCEPTED
+  PENDING
+  REJECTED
+}
+
+enum NotificationType {
+  PRICE_DROP
+  ALERT_TRIGGERED
+  DEAL
+  SYSTEM
+}
+
+enum JobStatus {
+  RUNNING
+  SUCCESS
+  FAILED
+}
+
+// ============================== USER =======================================
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  image        String?
+  role         Role     @default(USER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  favorites     Favorite[]
+  priceAlerts   PriceAlert[]
+  searchHistory SearchHistory[]
+  notifications Notification[]
+
+  @@index([role])
+  @@map("users")
+}
+
+// ============================ CATALOGUE ====================================
+
+model Category {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?
+  imageUrl    String?
+  sortOrder   Int      @default(0)
+  /// Self relation: a category may have subcategories.
+  parentId    String?
+  parent      Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children    Category[] @relation("CategoryTree")
+  createdAt   DateTime @default(now())
+
+  products Product[]
+
+  @@index([parentId])
+  @@map("categories")
+}
+
+model Product {
+  id          String   @id @default(cuid())
+  title       String
+  slug        String   @unique
+  brand       String
+  description String?
+  categoryId  String
+  category    Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  imageUrl    String?
+  /// Denormalised rollups kept fresh by the pricing service so listing pages can
+  /// sort/filter on price without N+1 queries.
+  rating       Float    @default(0)
+  reviewCount  Int      @default(0)
+  lowestPrice  Int?
+  highestPrice Int?
+  cheapestRetailerId String?
+  updatedAtPriceAt   DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Full-text search document (generated column, see migration SQL).
+  searchVector Unsupported("tsvector")?
+
+  variants ProductVariant[]
+
+  @@index([brand])
+  @@index([categoryId])
+  @@index([lowestPrice])
+  @@index([title])
+  @@map("products")
+}
+
+model ProductVariant {
+  id            String  @id @default(cuid())
+  productId     String
+  product       Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  /// Canonical, human readable variant title, e.g. "128GB Black".
+  title         String
+  /// Canonical URL slug for the variant, e.g. "apple-iphone-16-128gb-black".
+  slug          String  @unique
+  sku           String?
+  modelNumber   String?
+  gtin          String?
+  color         String?
+  size          String?
+  storage       String?
+  imageUrl      String?
+  specifications Json?
+  /// Denormalised comparison rollups (refreshed by the pricing service).
+  lowestPrice       Int?
+  highestPrice      Int?
+  cheapestListingId String?
+  cheapestRetailerId String?
+  listingCount      Int      @default(0)
+  /// Best discount percentage currently available on any listing (0-100).
+  bestDiscountPercent Int    @default(0)
+  /// Fastest published delivery across listings, in days.
+  fastestDeliveryDays Int?
+  /// Rollups refreshed at (pricing service).
+  rollupsUpdatedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  searchVector Unsupported("tsvector")?
+
+  listings  ProductListing[]
+  favorites Favorite[]
+  alerts    PriceAlert[]
+
+  @@index([productId])
+  @@index([sku])
+  @@index([modelNumber])
+  @@index([gtin])
+  @@index([lowestPrice])
+  @@index([bestDiscountPercent])
+  @@map("product_variants")
+}
+
+// ============================ RETAILERS ====================================
+
+model Retailer {
+  id         String   @id @default(cuid())
+  name       String
+  slug       String   @unique
+  logoUrl    String?
+  websiteUrl String
+  /// Brand colour used by the UI to render the retailer badge.
+  brandColor String   @default("#111827")
+  isActive   Boolean  @default(true)
+  /// Affiliate plumbing. `affiliateUrlTemplate` may contain the `{retailerProductId}`
+  /// and `{productUrl}` placeholders and is applied by the affiliate service.
+  affiliateNetwork     String?
+  affiliateId          String?
+  affiliateUrlTemplate String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  listings ProductListing[]
+
+  @@index([isActive])
+  @@map("retailers")
+}
+
+// ======================= LISTINGS (retailer offers) ========================
+
+model ProductListing {
+  id               String         @id @default(cuid())
+  productVariantId String
+  productVariant   ProductVariant @relation(fields: [productVariantId], references: [id], onDelete: Cascade)
+  retailerId       String
+  retailer         Retailer       @relation(fields: [retailerId], references: [id], onDelete: Cascade)
+  /// The retailer's own product identifier.
+  retailerProductId String
+  /// Exactly what the retailer calls the product (raw, unnormalised).
+  rawTitle        String
+  /// Normalised title used by the matching engine.
+  normalizedTitle String
+  productUrl      String
+  affiliateUrl    String?
+  availability    Availability @default(UNKNOWN)
+  deliveryText    String?
+  deliveryFee     Int          @default(0)
+  deliveryDays    Int?
+  /// Where this listing came from, and how fresh it is.
+  source          ListingSource @default(DEMO)
+  lastCheckedAt   DateTime?
+  resolutionStatus ResolutionStatus @default(RESOLVED)
+  /// Identity-resolution confidence (0-100) for how sure we are this listing is
+  /// the same physical product as the canonical variant.
+  matchConfidence Int          @default(100)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  prices Price[]
+
+  @@unique([retailerId, retailerProductId])
+  @@index([productVariantId])
+  @@index([retailerId])
+  @@index([resolutionStatus])
+  @@index([normalizedTitle])
+  @@map("product_listings")
+}
+
+/// Append-only price history. A row is never updated; every new check appends.
+model Price {
+  id             String         @id @default(cuid())
+  listingId      String
+  listing        ProductListing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  price          Int
+  mrp            Int
+  discount       Int            @default(0)
+  deliveryFee    Int            @default(0)
+  effectivePrice Int
+  currency       String         @default("INR")
+  inStock        Boolean        @default(true)
+  checkedAt      DateTime       @default(now())
+
+  @@index([listingId, checkedAt(sort: Desc)])
+  @@index([checkedAt])
+  @@index([effectivePrice])
+  @@map("prices")
+}
+
+/// Audit trail of the identity-resolution engine: which listing was matched to
+/// which canonical variant, with the score breakdown that produced the decision.
+model IdentityMatch {
+  id               String            @id @default(cuid())
+  listingId        String
+  productVariantId String?
+  rawTitle         String
+  score            Int
+  breakdown        Json
+  status           IdentityMatchStatus @default(ACCEPTED)
+  createdAt        DateTime          @default(now())
+
+  @@index([listingId])
+  @@index([productVariantId])
+  @@map("identity_matches")
+}
+
+// ============================ USER DATA ====================================
+
+model Favorite {
+  id               String         @id @default(cuid())
+  userId           String
+  user             User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productVariantId String
+  productVariant   ProductVariant @relation(fields: [productVariantId], references: [id], onDelete: Cascade)
+  createdAt        DateTime       @default(now())
+
+  @@unique([userId, productVariantId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("favorites")
+}
+
+model PriceAlert {
+  id               String         @id @default(cuid())
+  userId           String
+  user             User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productVariantId String
+  productVariant   ProductVariant @relation(fields: [productVariantId], references: [id], onDelete: Cascade)
+  targetPrice      Int
+  isActive         Boolean        @default(true)
+  /// Set when the alert last fired, to avoid duplicate notifications.
+  triggeredAt      DateTime?
+  triggeredPrice   Int?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  @@unique([userId, productVariantId])
+  @@index([userId, isActive])
+  @@index([productVariantId, isActive])
+  @@map("price_alerts")
+}
+
+model SearchHistory {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  query     String
+  /// Lower-cased, whitespace-collapsed form used for aggregation.
+  normalizedQuery String
+  resultCount Int    @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([normalizedQuery])
+  @@map("search_history")
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  message   String
+  link      String?
+  metadata  Json?
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  @@index([userId, read])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+// ============================== JOBS =======================================
+
+model PriceUpdateRun {
+  id                  String    @id @default(cuid())
+  status              JobStatus @default(RUNNING)
+  triggeredBy         String    @default("schedule")
+  listingsChecked     Int       @default(0)
+  priceRecordsCreated Int       @default(0)
+  alertsTriggered     Int       @default(0)
+  notificationsSent   Int       @default(0)
+  startedAt           DateTime  @default(now())
+  finishedAt          DateTime?
+  error               String?
+
+  @@index([startedAt(sort: Desc)])
+  @@map("price_update_runs")
+}
